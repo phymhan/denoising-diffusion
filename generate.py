@@ -31,15 +31,19 @@ def p_sample_loop(self, model, noise, device, noise_fn=torch.randn, capture_ever
 
 
 if __name__ == "__main__":
-    conf = load_config(DiffusionConfig, "config/diffusion.conf", show=False)
-    ckpt = torch.load("ckpt-2400k.pt")
+    # conf = load_config(DiffusionConfig, "config/diffusion.conf", show=False)
+    conf = load_config(DiffusionConfig, "config/ffhq_128_cips.json", show=False)
+    # ckpt = torch.load("ckpt-2400k.pt")
+    which_iter = '040000'
+    ckpt = torch.load(f"checkpoint/diffusion_{which_iter}.pt")
     model = conf.model.make()
     model.load_state_dict(ckpt["ema"])
     model = model.to("cuda")
     betas = conf.diffusion.beta_schedule.make()
     diffusion = GaussianDiffusion(betas).to("cuda")
     noise = torch.randn([16, 3, 256, 256], device="cuda")
+    noise = torch.randn([16, 3, 128, 128], device="cuda")
     imgs = p_sample_loop(diffusion, model, noise, "cuda", capture_every=10)
     imgs = imgs[1:]
 
-    save_image(imgs[-1], "sample.png", normalize=True, range=(-1, 1), nrow=4)
+    save_image(imgs[-1], f"sample_{which_iter}.png", normalize=True, range=(-1, 1), nrow=4)

@@ -1,13 +1,13 @@
 dataset: {
     name: ffhq
     path: data/ffhq_lmdb
-    resolution: 256
+    resolution: 128
 }
 
 model: {
-    __target: model.UNet
+    __target: model.CIPSdenoise
     in_channel: 3
-    channel: 128
+    channel: 512
     channel_multiplier: [1, 1, 2, 2, 4, 4]
     n_res_blocks: 2
     attn_strides: [16]
@@ -15,6 +15,9 @@ model: {
     use_affine_time: false
     dropout: 0.0
     fold: 1
+    resolution: 128
+    hidden_size: 512
+    with_time_emb: true
 }
 
 diffusion: {
@@ -52,4 +55,14 @@ evaluate: {
     log_every: 10
     save_every: 10000
     valid_every: 10000
+}
+
+logging: {
+    wandb: true
+    name: ffhq_cips512
+    wandb_project: ddpm
+    wandb_entity: ligongh
+    log_root: logs
+    log_every: 10
+    save_every: 10000
 }

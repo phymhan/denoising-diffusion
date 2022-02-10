@@ -11,7 +11,7 @@ from tensorfn.config import (
 
 import diffusion
 import model
-
+# import cips_models
 
 class Dataset(Config):
     name: StrictStr
@@ -36,6 +36,15 @@ class Eval(Config):
     valid_every: StrictInt
     log_every: StrictInt
 
+class Logging(Config):
+    wandb: StrictBool
+    save_every: StrictInt
+    log_every: StrictInt
+    log_root: StrictStr
+    name: StrictStr
+    wandb_project: StrictStr
+    wandb_entity: StrictStr
+
 
 class DiffusionConfig(MainConfig):
     dataset: Dataset
@@ -43,3 +52,4 @@ class DiffusionConfig(MainConfig):
     diffusion: Diffusion
     training: Training
     evaluate: Eval
+    logging: Logging

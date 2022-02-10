@@ -5,7 +5,8 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 from pydantic import StrictInt, StrictFloat, StrictBool
-
+import pdb
+st = pdb.set_trace
 
 # def swish(input):
 #     return input * torch.sigmoid(input)
@@ -400,3 +401,60 @@ class UNet(nn.Module):
         out = spatial_unfold(out, self.fold)
 
         return out
+
+def convert_to_coord_format(b, h, w, device='cpu', integer_values=False):
+    if integer_values:
+        x_channel = torch.arange(w, dtype=torch.float, device=device).view(1, 1, 1, -1).repeat(b, 1, w, 1)
+        y_channel = torch.arange(h, dtype=torch.float, device=device).view(1, 1, -1, 1).repeat(b, 1, 1, h)
+    else:
+        x_channel = torch.linspace(-1, 1, w, device=device).view(1, 1, 1, -1).repeat(b, 1, w, 1)
+        y_channel = torch.linspace(-1, 1, h, device=device).view(1, 1, -1, 1).repeat(b, 1, 1, h)
+    return torch.cat((x_channel, y_channel), dim=1)
+
+from cips_models import CIPSskip
+class CIPSdenoise(nn.Module):
+    def __init__(
+        self,
+        in_channel = 3,
+        channel = 256,
+        channel_multiplier = [1, 1, 2, 2, 4, 4],
+        n_res_blocks = 2,
+        attn_strides = [16],
+        attn_heads = 1,
+        use_affine_time = False,
+        dropout = 0,
+        fold = 1,
+        resolution = 128,
+        hidden_size = 512,
+        with_time_emb = True,
+    ):
+        super(CIPSdenoise, self).__init__()
+
+        channel_multiplier = 2
+        activation = None
+        lr_mlp = 0.01
+        n_mlp = 8
+
+        self.size = resolution
+        self.with_time_emb = with_time_emb
+        # time_dim = channel * 4
+        time_dim = hidden_size
+        if with_time_emb:
+            self.time = nn.Sequential(
+                TimeEmbedding(channel),
+                linear(channel, time_dim),
+                Swish(),
+                linear(time_dim, time_dim),
+            )
+        else:
+            self.time = None
+        style_dim = time_dim
+        self.cips = CIPSskip(size=self.size, hidden_size=hidden_size, n_mlp=n_mlp, style_dim=style_dim, lr_mlp=lr_mlp,
+            activation=activation, channel_multiplier=channel_multiplier)
+
+    def forward(self, x, time):
+        coords = None
+        t = self.time(time) if self.time is not None else None
+        coords = convert_to_coord_format(x.shape[0], self.size, self.size, x.device, False) if coords is None else coords
+        rgb, _ = self.cips(x, coords, [t], input_is_latent=False)
+        return rgb

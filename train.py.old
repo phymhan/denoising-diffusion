@@ -13,11 +13,7 @@ from model import UNet
 from diffusion import GaussianDiffusion, make_beta_schedule
 from dataset import MultiResolutionDataset
 from config import DiffusionConfig
-from torchvision.utils import save_image
-from generate import p_sample_loop
-# import wandb
-import pdb
-st = pdb.set_trace
+
 
 def sample_data(loader):
     loader_iter = iter(loader)
@@ -43,14 +39,6 @@ def accumulate(model1, model2, decay=0.9999):
 
 
 def train(conf, loader, model, ema, diffusion, optimizer, scheduler, device, wandb):
-    log_dir = os.path.join(conf.logging.log_root, conf.logging.name)
-    os.makedirs(log_dir, exist_ok=True)
-    os.makedirs(os.path.join(log_dir, "weight"), exist_ok=True)
-    os.makedirs(os.path.join(log_dir, "sample"), exist_ok=True)
-
-    image_size = conf.dataset.resolution
-    noise = torch.randn([16, 3, image_size, image_size], device="cuda")
-
     loader = sample_data(loader)
 
     pbar = range(conf.training.n_iter + 1)
@@ -84,10 +72,10 @@ def train(conf, loader, model, ema, diffusion, optimizer, scheduler, device, wan
                 f"epoch: {epoch}; loss: {loss.item():.4f}; lr: {lr:.5f}"
             )
 
-            if wandb is not None and i % conf.logging.log_every == 0:
+            if wandb is not None and i % conf.evaluate.log_every == 0:
                 wandb.log({"epoch": epoch, "loss": loss.item(), "lr": lr}, step=i)
 
-            if i % conf.logging.save_every == 0:
+            if i % conf.evaluate.save_every == 0:
                 if conf.distributed:
                     model_module = model.module
 
@@ -102,28 +90,15 @@ def train(conf, loader, model, ema, diffusion, optimizer, scheduler, device, wan
                         "optimizer": optimizer.state_dict(),
                         "conf": conf,
                     },
-                    os.path.join(log_dir, "weight", f"diffusion_{str(i).zfill(6)}.pt"),
+                    f"checkpoint/diffusion_{str(i).zfill(6)}.pt",
                 )
-
-                imgs = p_sample_loop(diffusion, ema, noise, "cuda", capture_every=10)
-                imgs = imgs[1:]
-                save_image(imgs[-1], os.path.join(log_dir, "sample", f"{i:07d}.png"),
-                    normalize=True, range=(-1, 1), nrow=4)
 
 
 def main(conf):
     wandb = None
-    if dist.is_primary() and conf.logging.wandb:
+    if dist.is_primary() and conf.evaluate.wandb:
         wandb = load_wandb()
-        # wandb.init(project="denoising diffusion")
-        wandb.init(
-            settings=wandb.Settings(start_method='fork'),
-            project=conf.logging.wandb_project,
-            name=conf.logging.name,
-            entity=conf.logging.wandb_entity,
-            resume=False,
-            config=conf,
-        )
+        wandb.init(project="denoising diffusion")
 
     device = "cuda"
     beta_schedule = "linear"
