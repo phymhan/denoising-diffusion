@@ -132,22 +132,25 @@ class GaussianDiffusion(nn.Module):
         return mean, var, log_var_clipped
 
     def p_mean_variance(self, model, x, t, clip_denoised):
-        x_recon = self.predict_start_from_noise(x, t, noise=model(x, t))  # x_recon is predicted x_0
+        noise = model(x, t)
+        x_recon = self.predict_start_from_noise(x, t, noise=noise)  # x_recon is predicted x_0
 
         if clip_denoised:
             x_recon = x_recon.clamp(min=-1, max=1)
 
         mean, var, log_var = self.q_posterior(x_recon, x, t)
 
-        return mean, var, log_var
+        return mean, var, log_var, noise, x_recon
 
     def p_sample(self, model, x, t, noise_fn, clip_denoised=True, repeat_noise=False):
-        mean, _, log_var = self.p_mean_variance(model, x, t, clip_denoised)
+        mean, _, log_var, eps, x_0 = self.p_mean_variance(model, x, t, clip_denoised)
         noise = noise_like(x.shape, noise_fn, x.device, repeat_noise)
         shape = [x.shape[0]] + [1] * (x.ndim - 1)
         nonzero_mask = (1 - (t == 0).type(torch.float32)).view(*shape)  # don't add noise at t=0
 
-        return mean + nonzero_mask * torch.exp(0.5 * log_var) * noise  # randomness comes from rsample from posterior
+        sample = mean + nonzero_mask * torch.exp(0.5 * log_var) * noise
+
+        return sample, mean, eps, x_0
 
     @torch.no_grad()
     def p_sample_loop(self, model, shape, device, noise_fn=torch.randn):
