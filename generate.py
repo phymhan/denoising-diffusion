@@ -10,7 +10,7 @@ from diffusion import GaussianDiffusion, make_beta_schedule
 
 
 @torch.no_grad()
-def p_sample_loop(self, model, noise, device, noise_fn=torch.randn, capture_every=1000):
+def p_sample_loop(self, model, noise, device, noise_fn=torch.randn, capture_every=1000, z=None):
     img = noise
     imgs = []
 
@@ -20,6 +20,7 @@ def p_sample_loop(self, model, noise, device, noise_fn=torch.randn, capture_ever
             img,
             torch.full((img.shape[0],), i, dtype=torch.int64).to(device),
             noise_fn=noise_fn,
+            z=z,
         )
 
         if i % capture_every == 0:

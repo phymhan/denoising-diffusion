@@ -11,14 +11,17 @@ from tqdm import tqdm
 
 from model import UNet
 from diffusion import GaussianDiffusion, make_beta_schedule
-from dataset import get_image_dataset
+from dataset import MultiResolutionDataset
 from config import DiffusionConfig
 from torchvision.utils import save_image
 from generate import p_sample_loop
-import argparse
 # import wandb
 import pdb
 st = pdb.set_trace
+
+from utils_ext import encode_kl, decode_kl
+import random
+import pickle
 
 def sample_data(loader):
     loader_iter = iter(loader)
@@ -26,18 +29,13 @@ def sample_data(loader):
 
     while True:
         try:
-            img = next(loader_iter)
-            if isinstance(img, list):
-                img = img[0]
-            yield epoch, img
+            yield epoch, next(loader_iter)
 
         except StopIteration:
             epoch += 1
             loader_iter = iter(loader)
-            img = next(loader_iter)
-            if isinstance(img, list):
-                img = img[0]
-            yield epoch, img
+
+            yield epoch, next(loader_iter)
 
 
 def accumulate(model1, model2, decay=0.9999):
@@ -48,16 +46,46 @@ def accumulate(model1, model2, decay=0.9999):
         par1[k].data.mul_(decay).add_(par2[k].data, alpha=1 - decay)
 
 
-def train(conf, loader, model, ema, diffusion, optimizer, scheduler, device, wandb):
+def train(conf, loader, model, ema, ae, diffusion, optimizer, scheduler, device, wandb):
     log_dir = os.path.join(conf.logging.log_root, conf.logging.name)
     os.makedirs(log_dir, exist_ok=True)
     os.makedirs(os.path.join(log_dir, "weight"), exist_ok=True)
     os.makedirs(os.path.join(log_dir, "sample"), exist_ok=True)
 
-    image_size = conf.dataset.resolution
-    noise = torch.randn([16, 3, image_size, image_size], device="cuda")
-
     loader = sample_data(loader)
+    batch_size = conf.training.dataloader.batch_size
+
+    image_size = conf.dataset.resolution
+    n_sample = min(16, conf.training.dataloader.batch_size)
+    noise = torch.randn([n_sample, 3, image_size, image_size], device="cuda")
+    _, img_fixed = next(loader)
+    img_fixed = img_fixed.to(device)
+    with torch.no_grad():
+        zq_fixed, z_fixed, _ = encode_kl(ae, img_fixed)
+        imgs_ae_fixed = decode_kl(ae, zq_fixed)
+    del zq_fixed
+
+    z_baseline = None
+    if conf.training.classifier_free:
+        if not os.path.exists('mean_image.pkl'):
+            img_ = torch.zeros(3, image_size, image_size)
+            for i in range(10000):
+                epoch, img = next(loader)
+                img_ += img.mean(dim=0)
+            img_ /= 10000
+            with open('mean_image.pkl', 'wb') as f:
+                pickle.dump(img_, f)
+        else:
+            with open('mean_image.pkl', 'rb') as f:
+                img_ = pickle.load(f)
+        img_ = img_.unsqueeze(0).to(device)
+        z_baseline, _, _ = encode_kl(ae, img_)
+        z_baseline = z_baseline.repeat(batch_size, 1, 1, 1)
+
+    if conf.distributed:
+        model_module = model.module
+    else:
+        model_module = model
 
     pbar = range(conf.training.n_iter + 1)
 
@@ -73,7 +101,12 @@ def train(conf, loader, model, ema, diffusion, optimizer, scheduler, device, wan
             (img.shape[0],),
             device=device,
         )
-        loss = diffusion.p_loss(model, img, time)
+        with torch.no_grad():
+            if conf.training.classifier_free and random.random() < 0.3:
+                z = z_baseline
+            else:
+                zq, z, _ = encode_kl(ae, img)
+        loss = diffusion.p_loss(model, img, time, z=z)
         optimizer.zero_grad()
         loss.backward()
         nn.utils.clip_grad_norm_(model.parameters(), 1)
@@ -81,7 +114,7 @@ def train(conf, loader, model, ema, diffusion, optimizer, scheduler, device, wan
         optimizer.step()
 
         accumulate(
-            ema, model.module, 0 if i < conf.training.scheduler.warmup else 0.9999
+            ema, model_module, 0 if i < conf.training.scheduler.warmup else 0.9999
         )
 
         if dist.is_primary():
@@ -111,13 +144,30 @@ def train(conf, loader, model, ema, diffusion, optimizer, scheduler, device, wan
                     os.path.join(log_dir, "weight", f"diffusion_{str(i).zfill(6)}.pt"),
                 )
 
-                imgs = p_sample_loop(diffusion, ema, noise, "cuda", capture_every=10)
-                imgs = imgs[1:]
-                save_image(imgs[-1], os.path.join(log_dir, "sample", f"{i:07d}.png"),
-                    normalize=True, range=(-1, 1), nrow=4)
+                if conf.training.classifier_free:
+                    # sample one with z_fixed and one with baseline
+                    imgs = p_sample_loop(diffusion, ema, noise, "cuda", capture_every=100, z=z_fixed)
+                    img1 = imgs[1:][-1]
+
+                    imgs = p_sample_loop(diffusion, ema, noise, "cuda", capture_every=100, z=z_baseline)
+                    img2 = imgs[1:][-1]
+                else:
+                    # sample one with fixed noise and one with random noise
+                    # sample with fixed noise
+                    imgs = p_sample_loop(diffusion, ema, noise, "cuda", capture_every=100, z=z_fixed)
+                    img1 = imgs[1:][-1]
+
+                    # sample with random noise
+                    noise2 = torch.randn([n_sample, 3, image_size, image_size], device="cuda")
+                    imgs = p_sample_loop(diffusion, ema, noise2, "cuda", capture_every=100, z=z_fixed)
+                    img2 = imgs[1:][-1]
+
+                imgs_all = torch.cat((img_fixed, imgs_ae_fixed, img1, img2), dim=0)
+                save_image(imgs_all, os.path.join(log_dir, "sample", f"{i:07d}_rec.png"),
+                    normalize=True, range=(-1, 1), nrow=n_sample)
 
 
-def main(conf, args):
+def main(conf):
     wandb = None
     if dist.is_primary() and conf.logging.wandb:
         wandb = load_wandb()
@@ -136,21 +186,17 @@ def main(conf, args):
 
     conf.distributed = dist.get_world_size() > 1
 
-    # transform = transforms.Compose(
-    #     [
-    #         transforms.RandomHorizontalFlip(),
-    #         transforms.ToTensor(),
-    #         transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5), inplace=True),
-    #     ]
-    # )
-    # train_set = MultiResolutionDataset(
-    #     conf.dataset.path, transform, conf.dataset.resolution
-    # )
-    # assert conf.dataset.resolution == args.size
-    # assert conf.dataset.path == args.path
-    train_set = get_image_dataset(args, args.dataset, args.path,
-        random_crop=args.random_crop)
+    transform = transforms.Compose(
+        [
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5), inplace=True),
+        ]
+    )
 
+    train_set = MultiResolutionDataset(
+        conf.dataset.path, transform, conf.dataset.resolution
+    )
     train_sampler = dist.data_sampler(
         train_set, shuffle=True, distributed=conf.distributed
     )
@@ -185,25 +231,19 @@ def main(conf, args):
     betas = conf.diffusion.beta_schedule.make()
     diffusion = GaussianDiffusion(betas).to(device)
 
+    # Setup VQGAN
+    from utils_ext import get_vqgan_model
+    ae = get_vqgan_model(which_model='kl-f16')
+    ae.to(device)
+
     train(
-        conf, train_loader, model, ema, diffusion, optimizer, scheduler, device, wandb
+        conf, train_loader, model, ema, ae, diffusion, optimizer, scheduler, device, wandb
     )
 
 
 if __name__ == "__main__":
-    defaults = dict(
-        path=None,
-        name=None,
-        size=256,
-        batch=16,
-        iter=800000,
-        dataset='multires',
-        random_crop=False,
-        crop_size=0,
-    )
-    conf, args = load_arg_config(DiffusionConfig, add_dict=defaults)
-    conf.logging.name = args.name or conf.logging.name
+    conf = load_arg_config(DiffusionConfig)
 
     dist.launch(
-        main, conf.n_gpu, conf.n_machine, conf.machine_rank, conf.dist_url, args=(conf, args,)
+        main, conf.n_gpu, conf.n_machine, conf.machine_rank, conf.dist_url, args=(conf,)
     )

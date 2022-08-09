@@ -130,7 +130,14 @@ dmypy.json
 
 *.lmdb
 
-logs*
+logs*/
 *.png
 wandb
 data
+
+taming/
+ldm/
+data/
+ldm
+
+*.pkl

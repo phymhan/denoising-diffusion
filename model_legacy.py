@@ -279,16 +279,16 @@ class UNet(nn.Module):
         fold: StrictInt = 1,
         conditional: StrictBool = False,
         condition_dim: StrictInt = 256,
-        condition_strides: List[StrictInt] = [16],
-        condition_mapping: StrictBool = False,
+        condition_size: StrictInt = 16,
     ):
         super().__init__()
 
         self.fold = fold
         self.conditional = conditional
         self.condition_dim = condition_dim
-        self.condition_strides = condition_strides
-        self.condition_mapping = nn.ModuleDict() if condition_mapping else None
+        self.condition_size = condition_size
+        self.condition_mapping = None
+        use_mapping = condition_dim < 256
 
         time_dim = channel * 4
 
@@ -304,21 +304,22 @@ class UNet(nn.Module):
         down_layers = [conv2d(in_channel * (fold ** 2), channel, 3, padding=1)]
         feat_channels = [channel]
         in_channel = channel
-        condition_layer_indices = []
+        curr_res = 256
         cond_channel = self.condition_dim
+        done = False
 
         for i in range(n_block):
             for _ in range(n_res_blocks):
                 channel_mult = channel * channel_multiplier[i]
 
-                if self.conditional and 2 ** i in self.condition_strides:
-                    layer_index = str(len(down_layers))
-                    if condition_mapping:
-                        self.condition_mapping[layer_index] = conv2d(
-                            self.condition_dim, in_channel, 1, stride=1, padding=0)
+                if curr_res == self.condition_size and not done:
+                    if use_mapping:
+                        self.condition_mapping = conv2d(cond_channel, in_channel, 1, padding=0)
                         cond_channel = in_channel
                     in_channel += cond_channel
-                    condition_layer_indices.append(layer_index)
+                    cond_channel = 0
+                    self.cond_i = len(down_layers)
+                    done = True
 
                 down_layers.append(
                     ResBlockWithAttention(
@@ -338,9 +339,9 @@ class UNet(nn.Module):
             if i != n_block - 1:
                 down_layers.append(Downsample(in_channel))
                 feat_channels.append(in_channel)
+                curr_res /= 2
 
         self.down = nn.ModuleList(down_layers)
-        self.condition_layer_indices = condition_layer_indices
 
         self.mid = nn.ModuleList(
             [
@@ -402,10 +403,9 @@ class UNet(nn.Module):
 
         out = spatial_fold(input, self.fold)
         for i, layer in enumerate(self.down):
-            layer_index = str(i)
-            if self.conditional and layer_index in self.condition_layer_indices:
+            if self.conditional and i == self.cond_i:
                 if self.condition_mapping is not None:
-                    z = self.condition_mapping[layer_index](z)
+                    z = self.condition_mapping(z)
                 out = torch.cat((out, z), dim=1)
             if isinstance(layer, ResBlockWithAttention):
                 out = layer(out, time_embed)

@@ -2,6 +2,7 @@ from typing import Optional, List
 from pydantic import StrictStr, StrictInt, StrictFloat, StrictBool
 from tensorfn.config import (
     MainConfig,
+    MyConfig,
     Config,
     Optimizer,
     Scheduler,
@@ -10,7 +11,7 @@ from tensorfn.config import (
 )
 
 import diffusion
-import model
+# import model
 # import cips_models
 
 class Dataset(Config):
@@ -28,6 +29,7 @@ class Training(Config):
     optimizer: Optimizer
     scheduler: Optional[Scheduler]
     dataloader: DataLoader
+    classifier_free: StrictBool
 
 
 class Eval(Config):

@@ -3,6 +3,8 @@ import math
 import torch
 from torch import nn
 from torch.nn import functional as F
+import pdb
+st = pdb.set_trace
 
 
 def make_beta_schedule(
@@ -54,12 +56,13 @@ def noise_like(shape, noise_fn, device, repeat=False):
 
 
 class GaussianDiffusion(nn.Module):
-    def __init__(self, betas):
+    def __init__(self, betas, rescale_timesteps=False):
         super().__init__()
 
         betas = betas.type(torch.float64)
         timesteps = betas.shape[0]
         self.num_timesteps = int(timesteps)
+        self.rescale_timesteps = rescale_timesteps
 
         alphas = 1 - betas
         alphas_cumprod = torch.cumprod(alphas, 0)
@@ -103,12 +106,12 @@ class GaussianDiffusion(nn.Module):
             + extract(self.sqrt_one_minus_alphas_cumprod, t, x_0.shape) * noise
         )
 
-    def p_loss(self, model, x_0, t, noise=None):
+    def p_loss(self, model, x_0, t, noise=None, z=None):
         if noise is None:
             noise = torch.randn_like(x_0)
 
         x_noise = self.q_sample(x_0, t, noise)
-        x_recon = model(x_noise, t)  # x_recon is predicted noise epsilon_t
+        x_recon = model(x_noise, t, z=z)  # x_recon is predicted noise epsilon_t
 
         return F.mse_loss(x_recon, noise)
 
@@ -120,6 +123,12 @@ class GaussianDiffusion(nn.Module):
             extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t
             - extract(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape) * noise
         )
+    
+    def _predict_eps_from_xstart(self, x_t, t, pred_xstart):
+        return (
+            extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t
+            - pred_xstart
+        ) / extract(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape)
 
     def q_posterior(self, x_0, x_t, t):
         mean = (
@@ -131,18 +140,21 @@ class GaussianDiffusion(nn.Module):
 
         return mean, var, log_var_clipped
 
-    def p_mean_variance(self, model, x, t, clip_denoised):
-        x_recon = self.predict_start_from_noise(x, t, noise=model(x, t))  # x_recon is predicted x_0
+    def p_mean_variance(self, model, x, t, clip_denoised, z=None, return_xstart=False):
+        x_recon = self.predict_start_from_noise(x, t, noise=model(x, t, z=z))  # x_recon is predicted x_0
 
         if clip_denoised:
             x_recon = x_recon.clamp(min=-1, max=1)
 
         mean, var, log_var = self.q_posterior(x_recon, x, t)
 
+        if return_xstart:
+            return mean, var, log_var, x_recon
+
         return mean, var, log_var
 
-    def p_sample(self, model, x, t, noise_fn, clip_denoised=True, repeat_noise=False):
-        mean, _, log_var = self.p_mean_variance(model, x, t, clip_denoised)
+    def p_sample(self, model, x, t, noise_fn, clip_denoised=True, repeat_noise=False, z=None):
+        mean, _, log_var = self.p_mean_variance(model, x, t, clip_denoised, z=z)
         noise = noise_like(x.shape, noise_fn, x.device, repeat_noise)
         shape = [x.shape[0]] + [1] * (x.ndim - 1)
         nonzero_mask = (1 - (t == 0).type(torch.float32)).view(*shape)  # don't add noise at t=0
@@ -150,7 +162,7 @@ class GaussianDiffusion(nn.Module):
         return mean + nonzero_mask * torch.exp(0.5 * log_var) * noise  # randomness comes from rsample from posterior
 
     @torch.no_grad()
-    def p_sample_loop(self, model, shape, device, noise_fn=torch.randn):
+    def p_sample_loop(self, model, shape, device, noise_fn=torch.randn, z=None):
         img = noise_fn(shape, device=device)
 
         for i in reversed(range(self.num_timesteps)):
@@ -159,6 +171,54 @@ class GaussianDiffusion(nn.Module):
                 img,
                 torch.full((shape[0],), i, dtype=torch.int64).to(device),
                 noise_fn=noise_fn,
+                z=z,
             )
 
         return img
+
+    @torch.no_grad()
+    def ddim_sample_loop(self, model, shape, device, noise_fn=torch.randn, z=None, eta=0.0):
+        img = noise_fn(shape, device=device)
+
+        for i in reversed(range(self.num_timesteps)):
+            img = self.ddim_sample(
+                model,
+                img,
+                torch.full((shape[0],), i, dtype=torch.int64).to(device),
+                noise_fn=noise_fn,
+                z=z,
+                eta=eta,
+            )
+
+        return img
+
+    def ddim_sample(self, model, x, t, noise_fn, clip_denoised=True, repeat_noise=False, z=None, eta=0.0):
+        mean, _, log_var, pred_xstart = self.p_mean_variance(model, x, t, clip_denoised, z=z, return_xstart=True)
+        
+        # Usually our model outputs epsilon, but we re-derive it in case we used x_start or x_prev prediction.
+        eps = self._predict_eps_from_xstart(x, t, pred_xstart)
+
+        alpha_bar = extract(self.alphas_cumprod, t, x.shape)
+        alpha_bar_prev = extract(self.alphas_cumprod_prev, t, x.shape)
+        sigma = (
+            eta
+            * torch.sqrt((1 - alpha_bar_prev) / (1 - alpha_bar))
+            * torch.sqrt(1 - alpha_bar / alpha_bar_prev)
+        )
+        st()
+        # Equation 12.
+        noise = noise_like(x.shape, noise_fn, x.device, repeat_noise)
+        mean_pred = (
+            pred_xstart * torch.sqrt(alpha_bar_prev)
+            + torch.sqrt(1 - alpha_bar_prev - sigma ** 2) * eps
+        )
+        # nonzero_mask = (
+        #     (t != 0).float().view(-1, *([1] * (len(x.shape) - 1)))
+        # )  # no noise when t == 0
+        shape = [x.shape[0]] + [1] * (x.ndim - 1)
+        nonzero_mask = (1 - (t == 0).type(torch.float32)).view(*shape)  # don't add noise at t=0
+        sample = mean_pred + nonzero_mask * sigma * noise
+
+        return sample
+
+
